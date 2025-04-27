@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "outDir": "./out",
+    "rootDir": "./",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "removeComments": true,
+    "moduleResolution": "node"
+  },
+  "include": [
+    "index.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "out"
+  ]
+}

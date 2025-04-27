@@ -1,0 +1,22 @@
+{
+  "name": "yt-stats-bot",
+  "version": "1.0.0",
+  "main": "out/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "command-line-args": "^6.0.1",
+    "groq-sdk": "^0.20.1",
+    "puppeteer": "^24.7.2",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "devDependencies": {
+    "@types/command-line-args": "^5.2.3"
+  }
+}
