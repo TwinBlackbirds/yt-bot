@@ -10,7 +10,7 @@ I felt that the video had some issues in its method, so I decided I would perfor
 
 ### Dependencies
 * Node.js
-* Typescript (tsc)
+* TypeScript (`tsc`)
 
 ### How to Use
 1. Install packages using a package manager such as `npm`. 
