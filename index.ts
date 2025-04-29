@@ -23,6 +23,9 @@ import VideoDetails from "./Models/VideoDetails";
 import CSVPayload from "./Models/CSVPayload";
 import Groq from 'groq-sdk';
 import {ChatCompletion} from "groq-sdk/resources/chat/completions";
+import * as fs from "node:fs";
+
+const SAVE_LOC: string = get_save_loc();
 
 // stealth plugin
 puppeteer.use(StealthPlugin())
@@ -35,12 +38,22 @@ const client = new Groq({
 // example of using the groq api
 async function ask_groq(message: string): Promise<ChatCompletion> {
     return client.chat.completions.create({
-        messages: [{ role: 'user', content: message }],
+        messages: [{role: 'system', content: 'Respond only in one word.'}, { role: 'user', content: message }],
         model: 'llama3-8b-8192',
     });
     // .choices[0].message.content to access text content
 }
 
+function get_save_loc(): string {
+    let i = 1;
+    if (!fs.existsSync(`./csv`)) {
+        fs.mkdirSync(`./csv`);
+    }
+    while (fs.existsSync(`./csv/${i}.csv`)) {
+        i++;
+    }
+    return `./csv/${i}.csv`;
+}
 
 async function sleep(s: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, s * 1000));
@@ -76,24 +89,20 @@ function print_help_and_exit(): void {
 async function gather_video_details(tab: Page): Promise<VideoDetails> {
 
     console.log("gathering video details...");
-    await tab.evaluate(() => (this.window.scrollTo(0, 1080)))
-    await sleep(3);
-    await tab.evaluate(() => (this.window.scrollTo(0, 0)))
-    await sleep(3);
     let skip_ad: ElementHandle | null = null;
     try {
-        skip_ad = await tab.waitForSelector("button[id*='skip-button']", {timeout: 10000});
+        skip_ad = await tab.waitForSelector("button[id*='skip-button']", {timeout: 5000});
     } catch {
         skip_ad = null;
     }
     while (skip_ad != null) {
+        await sleep(5); // wait for button to be clickable
         console.log("skipping ad...");
         await skip_ad.click();
-        await sleep(5);
         try {
-            await tab.waitForSelector("button[id*='skip-button']", {timeout: 10000});
+            skip_ad = await tab.waitForSelector("button[id*='skip-button']", {timeout: 10000});
         } catch {
-            skip_ad = null;
+            break;
         }
     }
     let video_details = new VideoDetails();
@@ -117,11 +126,35 @@ async function gather_video_details(tab: Page): Promise<VideoDetails> {
 
     let url = tab.url();
 
-    let likes = (await tab.$$("like-button-view-model div[class*='text-content']"))[0]; // in formatted with K, M, etc.
-    let likes_text = await (await likes.getProperty("textContent")).jsonValue();
+    // let likes = (await tab.$$("like-button-view-model div[class*='text-content']"))[0]; // in formatted with K, M, etc.
+    // let likes_text = await (await likes.getProperty("textContent")).jsonValue();
 
-    let comment_count = (await tab.$$("ytd-comments-header-renderer yt-formatted-string > span"))[0]; // has commas to remove
-    let comments = (await (await comment_count.getProperty("textContent")).jsonValue()).replaceAll(",", "");
+    let comments = await tab.$("ytd-comments-header-renderer yt-formatted-string > span");
+    let x: number = 1;
+    while (comments == null) {
+        if (x % 5 == 0 && x != 0) {
+            console.log(`Still can't find the comment count, reloading the page... (${x})`);
+            await tab.reload();
+        }
+        console.log(`comment count not found, scrolling in an attempt to load it... (${x})`);
+        for (let i = 0; i < x; i++) {
+            await tab.evaluate(() => (this.window.scrollBy(0, 1080)))
+            await sleep(3);
+        }
+        await tab.evaluate(() => (this.window.scrollTo(0, 0)))
+        try {
+            comments = await tab.waitForSelector("ytd-comments-header-renderer yt-formatted-string > span", {
+            timeout: 5000,
+            });
+        } catch {
+            comments = null;
+        }
+
+        x++;
+    }
+    console.log(`comment count not found, scrolling in an attempt to load it... (${x})`);
+    
+    let comments_text = (await (await comments.getProperty("textContent")).jsonValue()).replaceAll(",", "");
 
     let duration = await tab.$("span[class*='ytp-time-wrapper'] > .ytp-time-duration");
     let duration_text = await (await duration.getProperty("textContent")).jsonValue();
@@ -152,10 +185,10 @@ async function gather_video_details(tab: Page): Promise<VideoDetails> {
     let tags_text = await (await tags.getProperty("content")).jsonValue();
 
     video_details.title = title_text;
-    video_details.url = url;
+    video_details.url = url.split("&")[0];
     video_details.views = views_text;
     video_details.likes = ""; // having issues with this since it is a bunch of "scrolling number renderers"
-    video_details.comments = comments;
+    video_details.comments = comments_text;
     video_details.duration = duration_text;
     video_details.thumbnail = thumbnail_url;
     video_details.channel = channel_name_text;
@@ -176,15 +209,22 @@ async function get_starting_video(tab: Page): Promise<string> {
     return await (await all_vids[0].getProperty("href")).jsonValue();
 }
 
-async function get_next_url(tab: Page): Promise<string> {
+async function get_next_url(tab: Page, seen_videos: string[]): Promise<string> {
     console.log("getting next url...");
-    // depends on the run mode, but for now it will just be the first video in sidebar
+    // depends on the run mode, but for now it will just be the first video in the sidebar
     let all_vids = await tab.$$("#secondary .details a");
-    let first_non_sponsored_idx = 0;
+    let first_valid_video_idx = 0; // assume the first video is valid
     let href = await (await all_vids[0].getProperty("href")).jsonValue();
-    while (href.indexOf('adservice') > -1) {
-        first_non_sponsored_idx++;
-        href = await (await all_vids[first_non_sponsored_idx].getProperty("href")).jsonValue();
+    while (true) { // check validity
+        if (
+        href.indexOf('adservice') == -1 && // not an ad
+        href.indexOf('watch?') > -1 &&  // is a video
+        !seen_videos.includes(href)) { // hasn't been seen yet
+            break;
+        } // otherwise try next URL
+        first_valid_video_idx++;
+        // will give an out-of-bounds exception if we can't find a valid video (BAD STATE REGARDLESS!)
+        href = await (await all_vids[first_valid_video_idx].getProperty("href")).jsonValue();
     }
     return href;
 }
@@ -192,36 +232,42 @@ async function get_next_url(tab: Page): Promise<string> {
 // sanitize input to prevent delimiter issues (`)
 async function save_data_to_csv(payload: CSVPayload): Promise<void> {
     console.log("saving data to csv...");
+
     let csv_header: string = "";
     for (let key in payload) {
-        csv_header.concat(`${key}`);
+        csv_header += `${key}`;
         if (key !== Object.keys(payload)[Object.keys(payload).length - 1]) {
-            csv_header.concat("`");
+            csv_header += "`";
         }
+    }
+    csv_header += "\n";
+    if (!fs.existsSync(SAVE_LOC)) {
+        fs.writeFileSync(SAVE_LOC, csv_header);
     }
     let csv_string: string = "";
     for (let key in payload) {
         let value = payload[key];
         let sanitized_value: string = value.replaceAll("`", "'");
-        csv_string.concat(`${sanitized_value}`);
+        csv_string += `${sanitized_value}`;
         if (key !== Object.keys(payload)[Object.keys(payload).length - 1]) {
-            csv_string.concat("`");
+            csv_string += "`"
         }
     }
-    console.log(csv_header);
-    console.log(csv_string);
+    csv_string += "\n";
+    fs.appendFileSync(SAVE_LOC, csv_string);
 }
 
 // using AI, summarize the video for categorization later
 async function detect_video_topic(video_details: VideoDetails): Promise<CSVPayload> {
     console.log("detecting video topic...");
-    let prompt = "Please determine a one word topic for a video with the following details: "
+    let prompt = "Please determine a very general topic for the following video: "
     for (let key in video_details) {
-        prompt.concat(`${key}: ${video_details[key]}\n`);
+        prompt += `${key}: ${video_details[key]}\n`;
     }
+    // console.log(prompt);
     let ai_summary = await ask_groq(prompt);
     let message = ai_summary.choices[0].message.content;
-    console.log("got topic from ai: " + message);
+    console.log(`got topic from ai: '${message}'`);
     return new CSVPayload(video_details, message);
 }
 
@@ -273,27 +319,52 @@ async function run_bot(browser: Browser): Promise<void> {
         cond = false;
     }
     let url = await get_starting_video(tab);
+
+    // so we can skip duplicate videos
+    let seen_videos: string[] = [];
+
     // watch video and nav endlessly (or if n is set, n times)
     while (cond || amount > 0) {
         await tab.goto(url);
         await tab.waitForSelector("video");
+
+        // detect live stream
+        let live_video = await tab.$(".ytp-clip-watch-full-video-button");
+        let is_live = await live_video.getProperty("textContent");
+        if (!(await is_live.jsonValue()).includes("video")) {
+            console.log("video is live, skipping & blacklisting url...");
+            seen_videos.push(tab.url().split("&")[0]);
+            await sleep(3);
+            url = await get_next_url(tab, seen_videos);
+            continue;
+        }
         await sleep(3);
+        // get video details
         let video_details = await gather_video_details(tab);
+        seen_videos.push(video_details.url);
         console.log(video_details);
         // await watch_video(video_details);
         await sleep(10);
-        // let csv_payload = detect_video_topic(video_details);
-        // await save_data_to_csv(csv_payload);
-        url = await get_next_url(tab);
-        // await tab.goto(url);
+
+        // log the video details
+        let csv_payload = await detect_video_topic(video_details);
+        await save_data_to_csv(csv_payload);
+        // move on
+        url = await get_next_url(tab, seen_videos);
         if (amount > 0) {amount--;}
     }
+    // notes: crawling videos works, gathering details works, skipping ads works
+    // getting a homepage suggestion feed works,
+    // put data into csv text, save to file works
+    // scaffolding saved data into folders works
+    // TODO: statistic analysis, edge case error handling
+    // TODO: limit to 30m watching time
 }
 
 // main
 async function main() : Promise<void> {
     if (opts.help) { print_help_and_exit(); }
-    let headless: boolean  = opts.headless || false;
+    let headless: boolean  = opts.headless || true;
     // setup browser ctx
     let vp: Viewport = {width: 1920, height: 1080};
     let launch_options: LaunchOptions = {headless: headless, defaultViewport: vp, args: ['--mute-audio']}
