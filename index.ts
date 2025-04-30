@@ -12,8 +12,6 @@
    R & R studio (for data analysis)
 */
 
-// TODO: VPN/proxy functionality
-// TODO: create documentation for command line arguments
 
 import {Browser, ElementHandle, LaunchOptions, Page, TimeoutError, Viewport} from 'puppeteer';
 import puppeteer from 'puppeteer-extra';
@@ -66,7 +64,8 @@ let valid_args = [
     {name: 'start-mode', alias: 's', type: String},
     {name: 'run-mode', alias: 'r', type: String},
     {name: 'amount', alias: 'a', type: String},
-    {name: 'sentiment', alias: 't', type: String}
+    {name: 'sentiment', alias: 't', type: String},
+    {name: 'length', alias: 'l', type: Number}
 ];
 let opts = commandLineArgs(valid_args);
 
@@ -82,6 +81,7 @@ function print_help_and_exit(): void {
     console.log("  -r, --run-mode  run mode (default: first)");
     console.log("  -a, --amount  run amount (default: unlimited)");
     console.log("  -t, --sentiment  sentiment (default: none)");
+    console.log("  -l, --length  length of time to watch video in seconds (default: 180)");
     process.exit(0);
 }
 
@@ -98,13 +98,14 @@ async function gather_video_details(tab: Page): Promise<VideoDetails> {
     while (skip_ad != null) {
         await sleep(5); // wait for button to be clickable
         console.log("skipping ad...");
-        await skip_ad.click();
         try {
+            await skip_ad.click();
             skip_ad = await tab.waitForSelector("button[id*='skip-button']", {timeout: 10000});
         } catch {
             break;
         }
     }
+    console.log("ad skipped");
     let video_details = new VideoDetails();
 
     let title = await tab.waitForSelector("div[id='title'] yt-formatted-string[title]");
@@ -223,8 +224,13 @@ async function get_next_url(tab: Page, seen_videos: string[]): Promise<string> {
             break;
         } // otherwise try next URL
         first_valid_video_idx++;
+
         // will give an out-of-bounds exception if we can't find a valid video (BAD STATE REGARDLESS!)
-        href = await (await all_vids[first_valid_video_idx].getProperty("href")).jsonValue();
+        try {
+            href = await (await all_vids[first_valid_video_idx].getProperty("href")).jsonValue();
+        } catch {
+            href = await get_starting_video(tab); // go back to homepage as a last resort if we can't find a valid video
+        }
     }
     return href;
 }
@@ -273,6 +279,7 @@ async function detect_video_topic(video_details: VideoDetails): Promise<CSVPaylo
 
 async function watch_video(video_details: VideoDetails): Promise<void> {
     let dur_split = video_details.duration.split(":");
+    // get minutes
     let minutes = "0";
     if (dur_split.length > 3) { // if video is over a day
         minutes = dur_split[2];
@@ -282,11 +289,16 @@ async function watch_video(video_details: VideoDetails): Promise<void> {
     } else {
         minutes = dur_split[0];
     }
-    let time_to_watch_m = Math.floor(Math.random() * (parseInt(minutes))) * 60;
-    let time_to_watch_s = Math.floor(Math.random() * 60);
-    let time_to_watch = time_to_watch_m + time_to_watch_s;
-    console.log(`watching video for ${time_to_watch_m/60}m${time_to_watch_s}s (video is ${video_details.duration} long)`);
-    await sleep(time_to_watch);
+    let seconds = dur_split[dur_split.length - 1]; // get seconds (last)
+    let time_to_watch_s = Math.floor(Math.random() * 180); // watch video for up to 3 minutes
+    let time_to_watch_actual = 0;
+    if (parseInt(minutes) == 0 && time_to_watch_s > parseInt(seconds)) {
+        time_to_watch_actual = parseInt(seconds);
+    } else {
+        time_to_watch_actual = time_to_watch_s; // make sure that we don't watch for too long
+    }
+    console.log(`watching video for ${time_to_watch_actual}s (video is ${video_details.duration} long)`);
+    await sleep(time_to_watch_actual);
 }
 
 async function run_bot(browser: Browser): Promise<void> {
@@ -343,7 +355,7 @@ async function run_bot(browser: Browser): Promise<void> {
         let video_details = await gather_video_details(tab);
         seen_videos.push(video_details.url);
         console.log(video_details);
-        // await watch_video(video_details);
+        await watch_video(video_details);
         await sleep(10);
 
         // log the video details
@@ -357,8 +369,10 @@ async function run_bot(browser: Browser): Promise<void> {
     // getting a homepage suggestion feed works,
     // put data into csv text, save to file works
     // scaffolding saved data into folders works
+
     // TODO: statistic analysis, edge case error handling
-    // TODO: limit to 30m watching time
+    // TODO: VPN/proxy functionality
+    // TODO: create documentation for command line arguments
 }
 
 // main
