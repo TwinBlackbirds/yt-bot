@@ -13,7 +13,7 @@
 */
 
 
-import {Browser, ElementHandle, LaunchOptions, Page, TimeoutError, Viewport} from 'puppeteer';
+import {Browser, ElementHandle, JSHandle, LaunchOptions, Page, TimeoutError, Viewport} from 'puppeteer';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import commandLineArgs from 'command-line-args';
@@ -23,7 +23,8 @@ import Groq from 'groq-sdk';
 import {ChatCompletion} from "groq-sdk/resources/chat/completions";
 import * as fs from "node:fs";
 
-const SAVE_LOC: string = get_save_loc();
+let SAVE_LOC: string = "";
+get_save_loc().then((x) => {SAVE_LOC = x});
 
 // stealth plugin
 puppeteer.use(StealthPlugin())
@@ -32,6 +33,29 @@ puppeteer.use(StealthPlugin())
 const client = new Groq({
     // apiKey: process.env['GROQ_API_KEY'], // having issues with env var being recognized
 });
+
+// cli arg parsing (global)
+let valid_args = [
+    {name: 'help', alias: 'h', type: Boolean},
+    {name: 'gui', alias: 'g', type: Boolean},
+    {name: 'amount', alias: 'a', type: Number},
+    {name: 'time', alias: 't', type: Number}
+    // 'starter' - start at a certain video url (default: first video on homepage)
+];
+let opts = commandLineArgs(valid_args);
+
+// help dialog
+// DO NOT CALL AFTER INSTANTIATING BROWSER CONTEXT UNLESS YOU CLOSE IT MANUALLY
+function print_help_and_exit(): void {
+    console.log("----- twinblackbirds youtube bot manual ------");
+    console.log("usage: node index.js [options]");
+    console.log("options:");
+    console.log("  -h, --help\t  print this help message");
+    console.log("  -g, --gui\t  run in headful mode (graphical browser, default: false)");
+    console.log("  -a, --amount\t  amount of videos to collect (default: unlimited)");
+    console.log("  -t, --time\t  length of time to watch video in seconds (default: 180)");
+    process.exit(0);
+}
 
 // example of using the groq api
 async function ask_groq(message: string): Promise<ChatCompletion> {
@@ -42,53 +66,28 @@ async function ask_groq(message: string): Promise<ChatCompletion> {
     // .choices[0].message.content to access text content
 }
 
-function get_save_loc(): string {
-    let i = 1;
+async function get_save_loc(): Promise<string> {
+    // get a unique path to save the csv to
     if (!fs.existsSync(`./csv`)) {
         fs.mkdirSync(`./csv`);
     }
-    while (fs.existsSync(`./csv/${i}.csv`)) {
-        i++;
+    let date = Date.now().toString();
+    let loc = `./csv/${date}.csv`
+    while (fs.existsSync(`./csv/${date}.csv`)) {
+        await sleep(1);
+        date = Date.now().toString();
+        loc = `./csv/${date}.csv`
     }
-    return `./csv/${i}.csv`;
+    console.log(`using csv path: '${loc}'`);
+    return loc;
 }
 
 async function sleep(s: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, s * 1000));
 }
 
-// cli arg parsing (global)
-let valid_args = [
-    {name: 'headless', alias: 'h', type: Boolean},
-    {name: 'help', alias: '?', type: Boolean},
-    {name: 'start-mode', alias: 's', type: String},
-    {name: 'run-mode', alias: 'r', type: String},
-    {name: 'amount', alias: 'a', type: String},
-    {name: 'sentiment', alias: 't', type: String},
-    {name: 'length', alias: 'l', type: Number}
-];
-let opts = commandLineArgs(valid_args);
-
-// help dialog
-// DO NOT CALL AFTER INSTANTIATING BROWSER CONTEXT UNLESS YOU CLOSE IT MANUALLY
-function print_help_and_exit(): void {
-    console.log("----- help ------");
-    console.log("usage: node index.js [options]");
-    console.log("options:");
-    console.log("  -h, --headless  run in headless mode");
-    console.log("  -?, --help      print this help message");
-    console.log("  -s, --start-mode  start mode (default: homepage)");
-    console.log("  -r, --run-mode  run mode (default: first)");
-    console.log("  -a, --amount  run amount (default: unlimited)");
-    console.log("  -t, --sentiment  sentiment (default: none)");
-    console.log("  -l, --length  length of time to watch video in seconds (default: 180)");
-    process.exit(0);
-}
-
-// pull the data from the page and create a VideoDetails class
-async function gather_video_details(tab: Page): Promise<VideoDetails> {
-
-    console.log("gathering video details...");
+async function skip_ad(tab: Page): Promise<void> {
+    console.log("checking for ad...");
     let skip_ad: ElementHandle | null = null;
     try {
         skip_ad = await tab.waitForSelector("button[id*='skip-button']", {timeout: 5000});
@@ -99,13 +98,31 @@ async function gather_video_details(tab: Page): Promise<VideoDetails> {
         await sleep(5); // wait for button to be clickable
         console.log("skipping ad...");
         try {
-            await skip_ad.click();
+            await skip_ad.click(); // attempt skip
             skip_ad = await tab.waitForSelector("button[id*='skip-button']", {timeout: 10000});
         } catch {
-            break;
+            console.log("ad skipped!");
+            return; // button is not there if we fail to click it (or find it), therefore no ad
         }
     }
-    console.log("ad skipped");
+    console.log("no ad found!");
+}
+
+function ensure_ascii(str: string) {
+    let regex = /[^ -~]+/m;
+    let test = regex.test(str);
+    if (test) {console.log("title was not entirely ascii, omitting invalid characters")}
+    while (test) {
+        test = regex.test(str);
+        str = str.replace(regex, "_");
+    }
+    return str;
+}
+
+// pull the data from the page and create a VideoDetails class
+async function gather_video_details(tab: Page): Promise<[VideoDetails, boolean]> {
+    console.log("gathering video details...");
+
     let video_details = new VideoDetails();
 
     let title = await tab.waitForSelector("div[id='title'] yt-formatted-string[title]");
@@ -114,48 +131,100 @@ async function gather_video_details(tab: Page): Promise<VideoDetails> {
     let meta_title = await tab.$("meta[name='title']");
     let meta_title_text = await (await meta_title.getProperty("content")).jsonValue();
 
+    let fails = 0;
     while (title_text.trim() != meta_title_text.trim()) {
-        console.log("Invalid metadata! Attempting to reload...")
+        if (fails > 10) {
+            console.log("could not get correct metadata after 10 attempts. leaving this video...")
+            return [new VideoDetails(), false]
+        }
+        console.log("invalid metadata! attempting to reload the page...")
 
-        title = await tab.waitForSelector("div[id='title'] yt-formatted-string[title]");
-        title_text = await (await title.getProperty("textContent")).jsonValue();
-
-        meta_title = await tab.$("meta[name='title']");
-        meta_title_text = await (await meta_title.getProperty("content")).jsonValue();
-        await tab.reload();
+        try {
+            title = await tab.waitForSelector("div[id='title'] yt-formatted-string[title]", {timeout: 5000});
+            let tc = await title.getProperty("textContent");
+            title_text = tc.toString().replace("JSHandle:", "");
+        } catch {
+            title_text = "No Title Element";
+        }
+        try {
+            meta_title = await tab.waitForSelector("meta[name='title']", {timeout: 5000});
+            let tc = await meta_title.getProperty("content");
+            meta_title_text = tc.toString().replace("JSHandle:", "");
+        } catch {
+            meta_title_text = "No Meta Title Element";
+        }
+        try {
+            await tab.reload({timeout: 15000});
+        } catch {
+            console.log("could not reload the tab for some reason. going back to homepage...")
+            return [new VideoDetails(), false]
+        }
+        fails++;
     }
+
+    title_text = ensure_ascii(title_text);
 
     let url = tab.url();
 
-    // let likes = (await tab.$$("like-button-view-model div[class*='text-content']"))[0]; // in formatted with K, M, etc.
-    // let likes_text = await (await likes.getProperty("textContent")).jsonValue();
+    // cant get the likes because of a youtube change
+    let likes = "";
 
     let comments = await tab.$("ytd-comments-header-renderer yt-formatted-string > span");
-    let x: number = 1;
+    let comments_text = "";
+    let comment_fails: number = 0;
     while (comments == null) {
-        if (x % 5 == 0 && x != 0) {
-            console.log(`Still can't find the comment count, reloading the page... (${x})`);
-            await tab.reload();
+
+        if (comment_fails % 3 == 0 && comment_fails != 0)
+        {
+            console.log(`still can't find the comment count, reloading the page... (${comment_fails}) ${tab.url()}`);
+            try {
+                await tab.reload({timeout: 15000});
+            } catch {
+                console.log("could not reload the tab for some reason. going back to homepage...")
+                return [new VideoDetails(), false]
+            }
         }
-        console.log(`comment count not found, scrolling in an attempt to load it... (${x})`);
-        for (let i = 0; i < x; i++) {
+
+        if (comment_fails > 10)
+        {
+            console.log("could not find comments after 10 attempts. leaving this video...")
+            return [new VideoDetails(), false]
+        }
+
+        for (let i = 0; i < comment_fails; i++)
+        {
             await tab.evaluate(() => (this.window.scrollBy(0, 1080)))
             await sleep(3);
         }
-        await tab.evaluate(() => (this.window.scrollTo(0, 0)))
-        try {
-            comments = await tab.waitForSelector("ytd-comments-header-renderer yt-formatted-string > span", {
-            timeout: 5000,
-            });
-        } catch {
-            comments = null;
-        }
 
-        x++;
+        try
+        {
+            comments = await tab.waitForSelector(
+                "ytd-comments-header-renderer yt-formatted-string > span",
+                { timeout: 5000 });
+            comments_text = (await (await comments.getProperty("textContent")).jsonValue()).replaceAll(",", "");
+        }
+        catch
+        {
+            comments = null;
+
+            // check if comments are turned off
+            let disabled_comments = await tab.$("#message > span");
+            if (disabled_comments != null)
+            {
+                let innerText = await disabled_comments.getProperty("innerText");
+                let value = await innerText.jsonValue();
+                if (value.toLowerCase().includes("turned off")) {
+                    comments_text = "N/A (disabled)";
+                    break;
+                }
+            }
+
+            comment_fails++;
+            console.log(`comment count not found, attempt to load it... (${comment_fails})`);
+        }
     }
-    console.log(`comment count not found, scrolling in an attempt to load it... (${x})`);
-    
-    let comments_text = (await (await comments.getProperty("textContent")).jsonValue()).replaceAll(",", "");
+    console.log("comment count found!");
 
     let duration = await tab.$("span[class*='ytp-time-wrapper'] > .ytp-time-duration");
     let duration_text = await (await duration.getProperty("textContent")).jsonValue();
@@ -168,12 +237,16 @@ async function gather_video_details(tab: Page): Promise<VideoDetails> {
 
     let channel_sub_count = await tab.$("yt-formatted-string#owner-sub-count");
     let channel_sub_count_text = await (await channel_sub_count.getProperty("textContent")).jsonValue();
+    channel_sub_count_text = channel_sub_count_text.toLowerCase()
+        .replaceAll(" subscribers", "")
+        .toUpperCase();
 
     let channel_url = await tab.$("div[id='owner'] a[class*='yt-formatted-string']");
     let channel_url_text = await (await channel_url.getProperty("href")).jsonValue();
 
-    let date_and_views_info = await tab.$("ytd-watch-info-text div#tooltip");
+    let date_and_views_info = await tab.waitForSelector("ytd-watch-info-text div#tooltip", {timeout: 5000});
     let date_and_views_text_arr = (await (await date_and_views_info.getProperty("textContent")).jsonValue()).split("•");
+
     let views_text = date_and_views_text_arr[0].trim().replaceAll(",", "").replaceAll(" views", "");
     let date_uploaded_text = date_and_views_text_arr[1].trim();
 
@@ -188,7 +261,7 @@ async function gather_video_details(tab: Page): Promise<VideoDetails> {
     video_details.title = title_text;
     video_details.url = url.split("&")[0];
     video_details.views = views_text;
-    video_details.likes = ""; // having issues with this since it is a bunch of "scrolling number renderers"
+    video_details.likes = likes; // having issues with this since it is a bunch of "scrolling number renderers"
     video_details.comments = comments_text;
     video_details.duration = duration_text;
     video_details.thumbnail = thumbnail_url;
@@ -200,22 +273,79 @@ async function gather_video_details(tab: Page): Promise<VideoDetails> {
     video_details.description = description_text;
     video_details.tags = tags_text;
 
-    return video_details;
+    if (opts.debug) {
+        console.log(video_details);
+    }
+    return [video_details, true];
 }
 
 async function get_starting_video(tab: Page): Promise<string> {
+    await tab.goto('https://www.youtube.com/');
+    await tab.waitForSelector('div[id="content"');
+    let fails = 1;
+    let no_feed: ElementHandle | null = await tab.$("div[id='content'] > [contents-location='FEED_NUDGE_CONTENTS_LOCATION_UNKNOWN']");
+    let _continue = (no_feed != null);
+    _continue ? console.log(`attempting to get a recommended feed... (${fails})`) : console.log("feed found!");
+    while (_continue) { // we do not have a feed ('search to get started' dialog)
+        try {
+            let shorts_button: ElementHandle = await tab.waitForSelector(
+                    "ytd-guide-entry-renderer > a[id='endpoint'][title='Shorts']",
+                    {timeout: 10000});
+            await shorts_button.click();
+            await tab.waitForSelector('video', {timeout: 10000});
+            await sleep(3); // watch for 3 seconds
+        } finally {
+            await tab.goto('https://www.youtube.com/');
+        }
+        try {
+            no_feed = await tab.waitForSelector(
+                "div[id='content'] > [contents-location='FEED_NUDGE_CONTENTS_LOCATION_UNKNOWN']",
+                {timeout: 5000});
+        } catch (e) {
+            if (e instanceof TimeoutError) {
+                console.log("feed found! double checking...");
+                try {
+                    let check: ElementHandle = await tab.waitForSelector("a#video-title-link", {timeout: 5000});
+                    if (check != null) {
+                        break;
+                    }
+                } catch {
+                    _continue = true;
+                }
+            }
+            else throw e;
+        }
+        fails++;
+        console.log(`attempting to get a recommended feed... (${fails})`);
+        _continue = (no_feed != null);
+    }
     console.log("getting starting url...");
     // depends on the run mode, but for now it will just be the first video in homepage
-    let all_vids = await tab.$$("a#video-title-link");
-    return await (await all_vids[0].getProperty("href")).jsonValue();
+    let first_video: ElementHandle = await tab.waitForSelector("a#video-title-link", {timeout: 5000});
+    let handle: JSHandle = await first_video.getProperty("href");
+    let url = handle.toString().replace("JSHandle:", "")
+    console.log(`starting url: '${url}'`);
+    return url;
 }
 
 async function get_next_url(tab: Page, seen_videos: string[]): Promise<string> {
     console.log("getting next url...");
-    // depends on the run mode, but for now it will just be the first video in the sidebar
-    let all_vids = await tab.$$("#secondary .details a");
+
+    let all_vids: ElementHandle[] = [];
+    try {
+        await tab.waitForSelector("a.ytd-compact-video-renderer", {timeout: 15000});
+    } finally {
+        all_vids = await tab.$$("a.ytd-compact-video-renderer");
+        if (all_vids.length == 0) {
+            console.log("no sidebar videos found, restarting from homepage...");
+            // noinspection ReturnInsideFinallyBlockJS
+            return await get_starting_video(tab);
+        }
+    }
+
     let first_valid_video_idx = 0; // assume the first video is valid
-    let href = await (await all_vids[0].getProperty("href")).jsonValue();
+    let prop: JSHandle = await all_vids[0].getProperty("href");
+    let href = prop.toString().replace("JSHandle:", "");
     while (true) { // check validity
         if (
         href.indexOf('adservice') == -1 && // not an ad
@@ -227,9 +357,11 @@ async function get_next_url(tab: Page, seen_videos: string[]): Promise<string> {
 
         // will give an out-of-bounds exception if we can't find a valid video (BAD STATE REGARDLESS!)
         try {
-            href = await (await all_vids[first_valid_video_idx].getProperty("href")).jsonValue();
+            let prop: JSHandle = await all_vids[first_valid_video_idx].getProperty("href");
+            href = prop.toString().replace("JSHandle:", "");
         } catch {
-            href = await get_starting_video(tab); // go back to homepage as a last resort if we can't find a valid video
+            console.log("no sidebar videos found, restarting from homepage...");
+            return await get_starting_video(tab);
         }
     }
     return href;
@@ -266,11 +398,13 @@ async function save_data_to_csv(payload: CSVPayload): Promise<void> {
 // using AI, summarize the video for categorization later
 async function detect_video_topic(video_details: VideoDetails): Promise<CSVPayload> {
     console.log("detecting video topic...");
-    let prompt = "Please determine a very general topic for the following video: "
+    let prompt = "Please determine a very general category for the following video: "
     for (let key in video_details) {
         prompt += `${key}: ${video_details[key]}\n`;
     }
-    // console.log(prompt);
+    if (opts.debug) {
+        console.log(prompt);
+    }
     let ai_summary = await ask_groq(prompt);
     let message = ai_summary.choices[0].message.content;
     console.log(`got topic from ai: '${message}'`);
@@ -278,8 +412,9 @@ async function detect_video_topic(video_details: VideoDetails): Promise<CSVPaylo
 }
 
 async function watch_video(video_details: VideoDetails): Promise<void> {
+
+    // parse video duration
     let dur_split = video_details.duration.split(":");
-    // get minutes
     let minutes = "0";
     if (dur_split.length > 3) { // if video is over a day
         minutes = dur_split[2];
@@ -290,40 +425,59 @@ async function watch_video(video_details: VideoDetails): Promise<void> {
         minutes = dur_split[0];
     }
     let seconds = dur_split[dur_split.length - 1]; // get seconds (last)
+
+    // get the amount of time we are supposed to watch if possible
     let time_to_watch_s = Math.floor(Math.random() * 180); // watch video for up to 3 minutes
+    if (opts.time != null) { // cli argument override
+        time_to_watch_s = parseInt(opts.time);
+    }
+
+    // make sure that we don't watch for too long
     let time_to_watch_actual = 0;
     if (parseInt(minutes) == 0 && time_to_watch_s > parseInt(seconds)) {
         time_to_watch_actual = parseInt(seconds);
     } else {
-        time_to_watch_actual = time_to_watch_s; // make sure that we don't watch for too long
+        time_to_watch_actual = time_to_watch_s;
     }
-    console.log(`watching video for ${time_to_watch_actual}s (video is ${video_details.duration} long)`);
-    await sleep(time_to_watch_actual);
+    console.log(`watching video "${video_details.title}" by '${video_details.channel}' (${video_details.channel_sub_count}) for ${time_to_watch_actual}s (video is ${video_details.duration} long)`);
+    await sleep(time_to_watch_actual); // perform 'watching'
 }
+
+async function check_video_is_livestream(tab: Page): Promise<boolean> {
+    console.log("checking if video is a livestream...");
+    let video = null;
+    while (video == null) {
+        try {
+            video = await tab.waitForSelector("video", {timeout: 10000});
+        } catch {
+            // a loading error must have occurred for this to happen
+            console.log("video not found, reloading the page...");
+            try {
+                await tab.reload({timeout: 15000});
+            } catch {
+                console.log("failed to load the page. bypassing this video in an attempt to continue...")
+                // something is seriously wrong with the state if this happens, so flag the url as bad
+                return true;
+            }
+        }
+    }
+    let live_video = await tab.$(".ytp-clip-watch-full-video-button");
+    let is_live = await live_video.getProperty("textContent");
+    if (!(await is_live.jsonValue()).includes("video")) {
+        console.log("video is a livestream!");
+        return true;
+    }
+    console.log("video is not a livestream!");
+}
+
+function remove_timestamp(orig_url: string) {
+    return orig_url.split("&")[0];
+}
+
 
 async function run_bot(browser: Browser): Promise<void> {
     let tab = await browser.newPage();
-    await tab.goto('https://www.youtube.com/');
-    await tab.waitForSelector('div[id="content"');
-    let no_feed = await tab.$("div[id='content'] > [contents-location='FEED_NUDGE_CONTENTS_LOCATION_UNKNOWN']");
-    no_feed != null ? console.log("attempting to get a recommended feed...") : console.log("feed found!");
-    while (no_feed != null) { // we do not have a feed ('search to get started' dialog)
-        console.log("still attempting to get a recommended feed...");
-        let shorts_button = await tab.waitForSelector("ytd-guide-entry-renderer > a[id='endpoint'][title='Shorts']");
-        await shorts_button.click();
-        await tab.waitForSelector('video');
-        await sleep(3);
-        await tab.goto('https://www.youtube.com/');
-        try {
-            no_feed = await tab.waitForSelector("div[id='content'] > [contents-location='FEED_NUDGE_CONTENTS_LOCATION_UNKNOWN']", {timeout: 10000});
-        } catch (e) {
-            if (e instanceof TimeoutError) {
-                console.log("feed found!");
-                break;
-            }
-            else throw e;
-        }
-    }
+
     let cond = true;
     let amount = 0;
     if (opts.amount !== 'unlimited' && opts.amount != null) {
@@ -337,53 +491,78 @@ async function run_bot(browser: Browser): Promise<void> {
 
     // watch video and nav endlessly (or if n is set, n times)
     while (cond || amount > 0) {
+        console.log("navigating to video...")
         await tab.goto(url);
-        await tab.waitForSelector("video");
 
-        // detect live stream
-        let live_video = await tab.$(".ytp-clip-watch-full-video-button");
-        let is_live = await live_video.getProperty("textContent");
-        if (!(await is_live.jsonValue()).includes("video")) {
+        let concurrent_livestreams = 0;
+
+        let is_live = await check_video_is_livestream(tab);
+        if (is_live) {
+            if (concurrent_livestreams > 4) {
+                console.log("stuck in livestream hell, going back to homepage");
+                url = await get_starting_video(tab);
+                continue;
+            }
             console.log("video is live, skipping & blacklisting url...");
-            seen_videos.push(tab.url().split("&")[0]);
+            seen_videos.push(remove_timestamp(tab.url()));
+
             await sleep(3);
             url = await get_next_url(tab, seen_videos);
+
+            concurrent_livestreams++;
             continue;
         }
-        await sleep(3);
-        // get video details
-        let video_details = await gather_video_details(tab);
-        seen_videos.push(video_details.url);
-        console.log(video_details);
-        await watch_video(video_details);
-        await sleep(10);
+        concurrent_livestreams = 0;
 
-        // log the video details
+        await skip_ad(tab);
+
+        let [video_details, successful_extraction] = await gather_video_details(tab);
+
+        // get video details
+        while (!successful_extraction) {
+            console.log("failed to gather video details, blacklisting url & restarting from homepage as a last resort...");
+            seen_videos.push(remove_timestamp(tab.url()));
+            await sleep(3);
+            url = await get_starting_video(tab);
+            [video_details, successful_extraction] = await gather_video_details(tab);
+        }
+
+        seen_videos.push(video_details.url);
+
+        let video_watching_promise =  watch_video(video_details);
+        await sleep(1) // flush console output
+        console.log("in the meantime:")
+
+        // log the video details while watching
         let csv_payload = await detect_video_topic(video_details);
         await save_data_to_csv(csv_payload);
-        // move on
         url = await get_next_url(tab, seen_videos);
-        if (amount > 0) {amount--;}
-    }
-    // notes: crawling videos works, gathering details works, skipping ads works
-    // getting a homepage suggestion feed works,
-    // put data into csv text, save to file works
-    // scaffolding saved data into folders works
 
+        console.log("finishing 'watching' the video now...")
+        await Promise.resolve(video_watching_promise)
+
+        // move on
+        if (amount > 0) {amount--;}
+
+    }
     // TODO: statistic analysis, edge case error handling
     // TODO: VPN/proxy functionality
-    // TODO: create documentation for command line arguments
 }
 
 // main
 async function main() : Promise<void> {
+    // cli args
     if (opts.help) { print_help_and_exit(); }
-    let headless: boolean  = opts.headless || true;
+    console.log("configuring...");
+    let headless: boolean  = (opts.gui == null ? true : opts.gui);
+
     // setup browser ctx
     let vp: Viewport = {width: 1920, height: 1080};
     let launch_options: LaunchOptions = {headless: headless, defaultViewport: vp, args: ['--mute-audio']}
+    console.log("launching browser...");
     let browser: Browser = await puppeteer.launch(launch_options);
 
+    // init main loop (run_bot)
     try {
         await run_bot(browser);
     } finally {
