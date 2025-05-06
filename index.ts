@@ -114,9 +114,13 @@ function ensure_ascii(str: string) {
     if (test) {console.log("title was not entirely ascii, omitting invalid characters")}
     while (test) {
         test = regex.test(str);
-        str = str.replace(regex, "_");
+        str = str.replace(regex, "");
     }
     return str;
+}
+
+function de_jshandle(handle: JSHandle): string {
+    return handle.toString().replace("JSHandle:", "");
 }
 
 // pull the data from the page and create a VideoDetails class
@@ -126,10 +130,12 @@ async function gather_video_details(tab: Page): Promise<[VideoDetails, boolean]>
     let video_details = new VideoDetails();
 
     let title = await tab.waitForSelector("div[id='title'] yt-formatted-string[title]");
-    let title_text = await (await title.getProperty("textContent")).jsonValue();
+    let title_handle = await title.getProperty("textContent");
+    let title_text = de_jshandle(title_handle);
 
     let meta_title = await tab.$("meta[name='title']");
-    let meta_title_text = await (await meta_title.getProperty("content")).jsonValue();
+    let meta_handle = await meta_title.getProperty("content");
+    let meta_title_text = de_jshandle(meta_handle);
 
     let fails = 0;
     while (title_text.trim() != meta_title_text.trim()) {
@@ -142,14 +148,14 @@ async function gather_video_details(tab: Page): Promise<[VideoDetails, boolean]>
         try {
             title = await tab.waitForSelector("div[id='title'] yt-formatted-string[title]", {timeout: 5000});
             let tc = await title.getProperty("textContent");
-            title_text = tc.toString().replace("JSHandle:", "");
+            title_text = de_jshandle(tc);
         } catch {
             title_text = "No Title Element";
         }
         try {
             meta_title = await tab.waitForSelector("meta[name='title']", {timeout: 5000});
             let tc = await meta_title.getProperty("content");
-            meta_title_text = tc.toString().replace("JSHandle:", "");
+            meta_title_text = de_jshandle(tc);
         } catch {
             meta_title_text = "No Meta Title Element";
         }
@@ -202,7 +208,7 @@ async function gather_video_details(tab: Page): Promise<[VideoDetails, boolean]>
             comments = await tab.waitForSelector(
                 "ytd-comments-header-renderer yt-formatted-string > span",
                 { timeout: 5000 });
-            comments_text = (await (await comments.getProperty("textContent")).jsonValue()).replaceAll(",", "");
+            comments_text = de_jshandle(await comments.getProperty("textContent"));
         }
         catch
         {
@@ -227,39 +233,49 @@ async function gather_video_details(tab: Page): Promise<[VideoDetails, boolean]>
     console.log("comment count found!");
 
     let duration = await tab.$("span[class*='ytp-time-wrapper'] > .ytp-time-duration");
-    let duration_text = await (await duration.getProperty("textContent")).jsonValue();
+    let duration_handle = await duration.getProperty("textContent");
+    let duration_text = de_jshandle(duration_handle)
 
     let thumbnail = await tab.$("link[rel='image_src']"); // get href
-    let thumbnail_url = await (await thumbnail.getProperty("href")).jsonValue();
+    let thumbnail_handle = await thumbnail.getProperty("href");
+    let thumbnail_url = de_jshandle(thumbnail_handle);
 
     let channel_name = await tab.$("div[id='owner'] yt-formatted-string[title]");
-    let channel_name_text = await (await channel_name.getProperty("textContent")).jsonValue();
+    let channel_name_handle = await channel_name.getProperty("textContent");
+    let channel_name_text = de_jshandle(channel_name_handle);
 
     let channel_sub_count = await tab.$("yt-formatted-string#owner-sub-count");
-    let channel_sub_count_text = await (await channel_sub_count.getProperty("textContent")).jsonValue();
+    let channel_sub_count_handle = await channel_sub_count.getProperty("textContent");
+    let channel_sub_count_text = de_jshandle(channel_sub_count_handle);
     channel_sub_count_text = channel_sub_count_text.toLowerCase()
         .replaceAll(" subscribers", "")
         .toUpperCase();
 
     let channel_url = await tab.$("div[id='owner'] a[class*='yt-formatted-string']");
-    let channel_url_text = await (await channel_url.getProperty("href")).jsonValue();
+    let channel_url_handle = await channel_url.getProperty("href");
+    let channel_url_text = de_jshandle(channel_url_handle);
 
     let date_and_views_info = await tab.waitForSelector("ytd-watch-info-text div#tooltip", {timeout: 5000});
-    let date_and_views_text_arr = (await (await date_and_views_info.getProperty("textContent")).jsonValue()).split("•");
+    let date_and_views_info_handle = await date_and_views_info.getProperty("textContent");
+    let date_and_views_text_arr = de_jshandle(date_and_views_info_handle).split("•");
 
-    let views_text = date_and_views_text_arr[0].trim().replaceAll(",", "").replaceAll(" views", "");
+    let views_text = date_and_views_text_arr[0].trim()
+        .replaceAll(",", "")
+        .replaceAll(" views", "");
     let date_uploaded_text = date_and_views_text_arr[1].trim();
 
     let date_gathered_text = Date.now().toString();
 
     let description_snippet = await tab.$("meta[name='description']");
-    let description_text = await (await description_snippet.getProperty("content")).jsonValue();
+    let description_snippet_handle = await description_snippet.getProperty("content");
+    let description_text = de_jshandle(description_snippet_handle);
 
     let tags = await tab.$("meta[name='keywords']");
-    let tags_text = await (await tags.getProperty("content")).jsonValue();
+    let tags_handle = await tags.getProperty("content");
+    let tags_text = de_jshandle(tags_handle);
 
     video_details.title = title_text;
-    video_details.url = url.split("&")[0];
+    video_details.url = remove_timestamp(url);
     video_details.views = views_text;
     video_details.likes = likes; // having issues with this since it is a bunch of "scrolling number renderers"
     video_details.comments = comments_text;
@@ -323,9 +339,10 @@ async function get_starting_video(tab: Page): Promise<string> {
     // depends on the run mode, but for now it will just be the first video in homepage
     let first_video: ElementHandle = await tab.waitForSelector("a#video-title-link", {timeout: 5000});
     let handle: JSHandle = await first_video.getProperty("href");
-    let url = handle.toString().replace("JSHandle:", "")
+    let url = de_jshandle(handle);
+    url = remove_timestamp(url);
     console.log(`starting url: '${url}'`);
-    return url;
+    return url
 }
 
 async function get_next_url(tab: Page, seen_videos: string[]): Promise<string> {
@@ -345,7 +362,7 @@ async function get_next_url(tab: Page, seen_videos: string[]): Promise<string> {
 
     let first_valid_video_idx = 0; // assume the first video is valid
     let prop: JSHandle = await all_vids[0].getProperty("href");
-    let href = prop.toString().replace("JSHandle:", "");
+    let href = de_jshandle(prop);
     while (true) { // check validity
         if (
         href.indexOf('adservice') == -1 && // not an ad
@@ -358,13 +375,13 @@ async function get_next_url(tab: Page, seen_videos: string[]): Promise<string> {
         // will give an out-of-bounds exception if we can't find a valid video (BAD STATE REGARDLESS!)
         try {
             let prop: JSHandle = await all_vids[first_valid_video_idx].getProperty("href");
-            href = prop.toString().replace("JSHandle:", "");
+            href = de_jshandle(prop);
         } catch {
             console.log("no sidebar videos found, restarting from homepage...");
             return await get_starting_video(tab);
         }
     }
-    return href;
+    return remove_timestamp(href);
 }
 
 // sanitize input to prevent delimiter issues (`)
@@ -463,7 +480,8 @@ async function check_video_is_livestream(tab: Page): Promise<boolean> {
     }
     let live_video = await tab.$(".ytp-clip-watch-full-video-button");
     let is_live = await live_video.getProperty("textContent");
-    if (!(await is_live.jsonValue()).includes("video")) {
+    let jvalue = await is_live.jsonValue();
+    if (!jvalue.includes("video")) {
         console.log("video is a livestream!");
         return true;
     }
@@ -471,11 +489,16 @@ async function check_video_is_livestream(tab: Page): Promise<boolean> {
 }
 
 function remove_timestamp(orig_url: string) {
-    return orig_url.split("&")[0];
+    let orig_url_split = orig_url.split("&");
+    if (orig_url_split.length > 1) {
+        console.log("removing timestamp from url...");
+        return orig_url_split[0];
+    }
+    return orig_url;
 }
 
 
-async function run_bot(browser: Browser): Promise<void> {
+async function run_bot(browser: Browser): Promise<boolean> {
     let tab = await browser.newPage();
 
     let cond = true;
@@ -519,12 +542,12 @@ async function run_bot(browser: Browser): Promise<void> {
         let [video_details, successful_extraction] = await gather_video_details(tab);
 
         // get video details
-        while (!successful_extraction) {
+        if (!successful_extraction) {
             console.log("failed to gather video details, blacklisting url & restarting from homepage as a last resort...");
             seen_videos.push(remove_timestamp(tab.url()));
             await sleep(3);
             url = await get_starting_video(tab);
-            [video_details, successful_extraction] = await gather_video_details(tab);
+            continue;
         }
 
         seen_videos.push(video_details.url);
@@ -545,8 +568,10 @@ async function run_bot(browser: Browser): Promise<void> {
         if (amount > 0) {amount--;}
 
     }
+    return true;
     // TODO: statistic analysis, edge case error handling
     // TODO: VPN/proxy functionality
+    // TODO: time taken to get video (this video - last video time) ? or the other way
 }
 
 // main
@@ -558,23 +583,35 @@ async function main() : Promise<void> {
 
     // setup browser ctx
     let vp: Viewport = {width: 1920, height: 1080};
-    let launch_options: LaunchOptions = {headless: headless, defaultViewport: vp, args: ['--mute-audio']}
+    let launch_options: LaunchOptions = {
+        headless: headless,
+        defaultViewport: vp,
+        args: ['--mute-audio'],
+        protocolTimeout: 120000
+    }
     console.log("launching browser...");
     let browser: Browser = await puppeteer.launch(launch_options);
 
     // init main loop (run_bot)
-    try {
-        await run_bot(browser);
-    } finally {
-        // ensure browser ctx is not left hanging after our node.js program closes
-        console.log("closing browser...");
+    while (true) {
         try {
-            await browser.close();
-            console.log("browser closed");
-        } catch {
-            console.log("browser already closed");
+            let stop = await run_bot(browser);
+            if (stop) {
+                break;
+            }
+            console.log("error occurred with the browser, restarting...");
+        } finally {
+            // ensure browser ctx is not left hanging after our node.js program closes
+            console.log("closing browser...");
+            try {
+                await browser.close();
+                console.log("browser closed");
+            } catch {
+                console.log("browser already closed");
+            }
         }
     }
+
 }
 
 main().then(() => console.log("commands executed"));
