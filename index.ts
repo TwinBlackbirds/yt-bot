@@ -23,7 +23,12 @@ import Groq from 'groq-sdk';
 import {ChatCompletion} from "groq-sdk/resources/chat/completions";
 import * as fs from "node:fs";
 
-let SAVE_LOC: string = "";
+// globals
+
+// keep track of videos we have already watched
+let SEEN_VIDEOS: string[] = [];
+let SAVE_LOC: string | null = null; // csv save location
+
 get_save_loc().then((x) => {SAVE_LOC = x});
 
 // stealth plugin
@@ -31,7 +36,7 @@ puppeteer.use(StealthPlugin())
 
 // global groq client
 const client = new Groq({
-    // apiKey: process.env['GROQ_API_KEY'], // having issues with env var being recognized
+    apiKey: process.env['GROQ_API_KEY'],
 });
 
 // cli arg parsing (global)
@@ -67,6 +72,9 @@ async function ask_groq(message: string): Promise<ChatCompletion> {
 }
 
 async function get_save_loc(): Promise<string> {
+    if (SAVE_LOC != null) {
+        return SAVE_LOC;
+    }
     // get a unique path to save the csv to
     if (!fs.existsSync(`./csv`)) {
         fs.mkdirSync(`./csv`);
@@ -124,7 +132,7 @@ function de_jshandle(handle: JSHandle): string {
 }
 
 // pull the data from the page and create a VideoDetails class
-async function gather_video_details(tab: Page): Promise<[VideoDetails, boolean]> {
+async function gather_video_details(tab: Page): Promise<VideoDetails> {
     console.log("gathering video details...");
 
     let video_details = new VideoDetails();
@@ -141,7 +149,7 @@ async function gather_video_details(tab: Page): Promise<[VideoDetails, boolean]>
     while (title_text.trim() != meta_title_text.trim()) {
         if (fails > 10) {
             console.log("could not get correct metadata after 10 attempts. leaving this video...")
-            return [new VideoDetails(), false]
+            throw new TimeoutError();
         }
         console.log("invalid metadata! attempting to reload the page...")
 
@@ -163,7 +171,7 @@ async function gather_video_details(tab: Page): Promise<[VideoDetails, boolean]>
             await tab.reload({timeout: 15000});
         } catch {
             console.log("could not reload the tab for some reason. going back to homepage...")
-            return [new VideoDetails(), false]
+            throw new TimeoutError();
         }
         fails++;
     }
@@ -187,14 +195,14 @@ async function gather_video_details(tab: Page): Promise<[VideoDetails, boolean]>
                 await tab.reload({timeout: 15000});
             } catch {
                 console.log("could not reload the tab for some reason. going back to homepage...")
-                return [new VideoDetails(), false]
+                throw new TimeoutError();
             }
         }
 
         if (comment_fails > 10)
         {
             console.log("could not find comments after 10 attempts. leaving this video...")
-            return [new VideoDetails(), false]
+            throw new TimeoutError();
         }
 
         for (let i = 0; i < comment_fails; i++)
@@ -232,7 +240,7 @@ async function gather_video_details(tab: Page): Promise<[VideoDetails, boolean]>
     }
     console.log("comment count found!");
 
-    let duration = await tab.$("span[class*='ytp-time-wrapper'] > .ytp-time-duration");
+    let duration = await tab.$(".ytp-time-duration");
     let duration_handle = await duration.getProperty("textContent");
     let duration_text = de_jshandle(duration_handle)
 
@@ -292,7 +300,7 @@ async function gather_video_details(tab: Page): Promise<[VideoDetails, boolean]>
     if (opts.debug) {
         console.log(video_details);
     }
-    return [video_details, true];
+    return video_details;
 }
 
 async function get_starting_video(tab: Page): Promise<string> {
@@ -334,41 +342,29 @@ async function get_starting_video(tab: Page): Promise<string> {
         fails++;
         console.log(`attempting to get a recommended feed... (${fails})`);
         _continue = (no_feed != null);
+        if (fails > 10) throw new TimeoutError(); // will restart the browser
     }
     console.log("getting starting url...");
-    // depends on the run mode, but for now it will just be the first video in homepage
-    let first_video: ElementHandle = await tab.waitForSelector("a#video-title-link", {timeout: 5000});
-    let handle: JSHandle = await first_video.getProperty("href");
-    let url = de_jshandle(handle);
-    url = remove_timestamp(url);
+    let all_vids: ElementHandle[] = await tab.$$("a#video-title-link");
+    let first_valid_video_url = await get_first_valid_url(tab, all_vids);
+    let url = remove_timestamp(first_valid_video_url);
     console.log(`starting url: '${url}'`);
     return url
 }
 
-async function get_next_url(tab: Page, seen_videos: string[]): Promise<string> {
-    console.log("getting next url...");
-
-    let all_vids: ElementHandle[] = [];
-    try {
-        await tab.waitForSelector("a.ytd-compact-video-renderer", {timeout: 15000});
-    } finally {
-        all_vids = await tab.$$("a.ytd-compact-video-renderer");
-        if (all_vids.length == 0) {
-            console.log("no sidebar videos found, restarting from homepage...");
-            // noinspection ReturnInsideFinallyBlockJS
-            return await get_starting_video(tab);
-        }
-    }
+// need this to also check for dupes on the home page incase we have to restart
+async function get_first_valid_url(tab: Page, all_vids: ElementHandle[]): Promise<string> {
+    // resolve first unseen url from a list of urls
 
     let first_valid_video_idx = 0; // assume the first video is valid
     let prop: JSHandle = await all_vids[0].getProperty("href");
     let href = de_jshandle(prop);
     while (true) { // check validity
         if (
-        href.indexOf('adservice') == -1 && // not an ad
-        href.indexOf('watch?') > -1 &&  // is a video
-        !seen_videos.includes(href)) { // hasn't been seen yet
-            break;
+            href.indexOf('adservice') < 0 && // not an ad
+            href.indexOf('watch?') > -1 &&  // is a video
+            !SEEN_VIDEOS.includes(href)) { // hasn't been seen yet
+            return href; // valid url
         } // otherwise try next URL
         first_valid_video_idx++;
 
@@ -381,7 +377,25 @@ async function get_next_url(tab: Page, seen_videos: string[]): Promise<string> {
             return await get_starting_video(tab);
         }
     }
-    return remove_timestamp(href);
+}
+
+
+async function get_next_url(tab: Page): Promise<string> {
+    console.log("getting next url...");
+
+    let all_vids: ElementHandle[] = [];
+    try {
+        await tab.waitForSelector("a.ytd-compact-video-renderer", {timeout: 15000});
+        await sleep(1);
+        all_vids = await tab.$$("a.ytd-compact-video-renderer");
+    } catch {
+        if (all_vids.length == 0) {
+            console.log("no sidebar videos found, restarting from homepage...");
+            return await get_starting_video(tab);
+        }
+    }
+    let first_valid_url = await get_first_valid_url(tab, all_vids);
+    return remove_timestamp(first_valid_url);
 }
 
 // sanitize input to prevent delimiter issues (`)
@@ -497,8 +511,28 @@ function remove_timestamp(orig_url: string) {
     return orig_url;
 }
 
+async function check_video_is_dupe(url: string): Promise<boolean> {
+    console.log("double checking if video is dupe...");
+    url = remove_timestamp(url)
+    let csv_string: string | null = null;
+    if (fs.existsSync(SAVE_LOC)) {
+        csv_string = fs.readFileSync(SAVE_LOC).toString(); // check csv if it exists
+    }
+    if (!SEEN_VIDEOS.includes(url)) { // if not in SEEN_VIDEOS list
+        if (csv_string != null && csv_string.includes(url)) return true; // extra dupe protection
+        return false; // video not in seen videos, not in csv
+    } else return true; //video must be in SEEN_VIDEOS
+}
+
+function blacklist_url(url: string): void {
+    console.log("adding url to blacklist...")
+    url = remove_timestamp(url)
+    SEEN_VIDEOS.push(url);
+}
+
 
 async function run_bot(browser: Browser): Promise<boolean> {
+    console.log("starting bot...")
     let tab = await browser.newPage();
 
     let cond = true;
@@ -509,28 +543,37 @@ async function run_bot(browser: Browser): Promise<boolean> {
     }
     let url = await get_starting_video(tab);
 
-    // so we can skip duplicate videos
-    let seen_videos: string[] = [];
 
     // watch video and nav endlessly (or if n is set, n times)
     while (cond || amount > 0) {
-        console.log("navigating to video...")
+        // dupe protection
+        if (await check_video_is_dupe(url)) {
+            console.log("video is a dupe! readding it to the blacklist and refusing to navigate!");
+            blacklist_url(url);
+            url = await get_next_url(tab); // find another video
+            continue;
+        } else {
+            console.log("video is not a dupe!");
+        }
+
+        console.log("navigating to video...");
         await tab.goto(url);
 
         let concurrent_livestreams = 0;
 
         let is_live = await check_video_is_livestream(tab);
         if (is_live) {
+            console.log("video is live, skipping & blacklisting url...");
+            blacklist_url(url);
+
             if (concurrent_livestreams > 4) {
                 console.log("stuck in livestream hell, going back to homepage");
                 url = await get_starting_video(tab);
                 continue;
             }
-            console.log("video is live, skipping & blacklisting url...");
-            seen_videos.push(remove_timestamp(tab.url()));
 
             await sleep(3);
-            url = await get_next_url(tab, seen_videos);
+            url = await get_next_url(tab);
 
             concurrent_livestreams++;
             continue;
@@ -539,27 +582,27 @@ async function run_bot(browser: Browser): Promise<boolean> {
 
         await skip_ad(tab);
 
-        let [video_details, successful_extraction] = await gather_video_details(tab);
-
-        // get video details
-        if (!successful_extraction) {
-            console.log("failed to gather video details, blacklisting url & restarting from homepage as a last resort...");
-            seen_videos.push(remove_timestamp(tab.url()));
+        let video_details = new VideoDetails();
+        try {
+            video_details = await gather_video_details(tab);
+        } catch (e) {
+            console.log(`failed to gather video details, blacklisting url & restarting from homepage as a last resort... (${e})`);
             await sleep(3);
             url = await get_starting_video(tab);
             continue;
+        } finally {
+            blacklist_url(url); // remove url from possible pool, it either caused our bot to fail or was a success
         }
 
-        seen_videos.push(video_details.url);
-
+        // watch video
         let video_watching_promise =  watch_video(video_details);
         await sleep(1) // flush console output
         console.log("in the meantime:")
 
-        // log the video details while watching
+        // log the video details while 'watching'
         let csv_payload = await detect_video_topic(video_details);
         await save_data_to_csv(csv_payload);
-        url = await get_next_url(tab, seen_videos);
+        url = await get_next_url(tab);
 
         console.log("finishing 'watching' the video now...")
         await Promise.resolve(video_watching_promise)
@@ -572,6 +615,7 @@ async function run_bot(browser: Browser): Promise<boolean> {
     // TODO: statistic analysis, edge case error handling
     // TODO: VPN/proxy functionality
     // TODO: time taken to get video (this video - last video time) ? or the other way
+    // TODO: scheduler (multiple bots at once)
 }
 
 // main
@@ -597,9 +641,13 @@ async function main() : Promise<void> {
         try {
             let stop = await run_bot(browser);
             if (stop) {
+                console.log("closing browser...");
+                await browser.close();
+                console.log("browser closed");
                 break;
             }
-            console.log("error occurred with the browser, restarting...");
+        } catch (e) {
+            console.log(`error occurred with the browser, restarting... (${e.message})`);
         } finally {
             // ensure browser ctx is not left hanging after our node.js program closes
             console.log("closing browser...");
@@ -610,6 +658,9 @@ async function main() : Promise<void> {
                 console.log("browser already closed");
             }
         }
+        await sleep(5);
+        console.log("relaunching browser...");
+        browser = await puppeteer.launch(launch_options);
     }
 
 }
