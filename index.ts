@@ -131,6 +131,15 @@ function de_jshandle(handle: JSHandle): string {
     return handle.toString().replace("JSHandle:", "");
 }
 
+function sanitize(text: string): string {
+    return text
+        .replaceAll("`", "") // csv delimiter
+        .replaceAll('"', '')
+        .replaceAll("'", "")
+        .replaceAll("\r", "")
+        .replaceAll("\n", "");
+}
+
 // pull the data from the page and create a VideoDetails class
 async function gather_video_details(tab: Page): Promise<VideoDetails> {
     console.log("gathering video details...");
@@ -282,20 +291,20 @@ async function gather_video_details(tab: Page): Promise<VideoDetails> {
     let tags_handle = await tags.getProperty("content");
     let tags_text = de_jshandle(tags_handle);
 
-    video_details.title = title_text;
+    video_details.title = sanitize(title_text);
     video_details.url = remove_timestamp(url);
-    video_details.views = views_text;
-    video_details.likes = likes; // having issues with this since it is a bunch of "scrolling number renderers"
-    video_details.comments = comments_text;
-    video_details.duration = duration_text;
-    video_details.thumbnail = thumbnail_url;
-    video_details.channel = channel_name_text;
-    video_details.channel_sub_count = channel_sub_count_text;
-    video_details.channel_url = channel_url_text;
-    video_details.date_uploaded = date_uploaded_text;
-    video_details.date_collected = date_gathered_text;
-    video_details.description = description_text;
-    video_details.tags = tags_text;
+    video_details.views = sanitize(views_text);
+    video_details.likes = sanitize(likes); // having issues with this since it is a bunch of "scrolling number renderers"
+    video_details.comments = sanitize(comments_text);
+    video_details.duration = sanitize(duration_text);
+    video_details.thumbnail = sanitize(thumbnail_url);
+    video_details.channel = sanitize(channel_name_text);
+    video_details.channel_sub_count = sanitize(channel_sub_count_text);
+    video_details.channel_url = sanitize(channel_url_text);
+    video_details.date_uploaded = sanitize(date_uploaded_text);
+    video_details.date_collected = sanitize(date_gathered_text);
+    video_details.description = sanitize(description_text);
+    video_details.tags = sanitize(tags_text);
 
     if (opts.debug) {
         console.log(video_details);
@@ -358,13 +367,14 @@ async function get_first_valid_url(tab: Page, all_vids: ElementHandle[]): Promis
 
     let first_valid_video_idx = 0; // assume the first video is valid
     let prop: JSHandle = await all_vids[0].getProperty("href");
-    let href = de_jshandle(prop);
+    let href = remove_timestamp(de_jshandle(prop));
     while (true) { // check validity
         if (
             href.indexOf('adservice') < 0 && // not an ad
-            href.indexOf('watch?') > -1 &&  // is a video
-            !SEEN_VIDEOS.includes(href)) { // hasn't been seen yet
-            return href; // valid url
+            href.indexOf('watch?') > -1) { // is a video
+            if (!await check_video_is_dupe(href)) { // double check is not dupe
+                return href; // valid url
+            }
         } // otherwise try next URL
         first_valid_video_idx++;
 
@@ -505,17 +515,16 @@ async function check_video_is_livestream(tab: Page): Promise<boolean> {
 function remove_timestamp(orig_url: string) {
     let orig_url_split = orig_url.split("&");
     if (orig_url_split.length > 1) {
-        console.log("removing timestamp from url...");
         return orig_url_split[0];
     }
     return orig_url;
 }
 
 async function check_video_is_dupe(url: string): Promise<boolean> {
-    console.log("double checking if video is dupe...");
     url = remove_timestamp(url)
     let csv_string: string | null = null;
     if (fs.existsSync(SAVE_LOC)) {
+        // may become a performance issue
         csv_string = fs.readFileSync(SAVE_LOC).toString(); // check csv if it exists
     }
     if (!SEEN_VIDEOS.includes(url)) { // if not in SEEN_VIDEOS list
@@ -546,8 +555,9 @@ async function run_bot(browser: Browser): Promise<boolean> {
 
     // watch video and nav endlessly (or if n is set, n times)
     while (cond || amount > 0) {
+        console.log("double checking if video is dupe...");
         // dupe protection
-        if (await check_video_is_dupe(url)) {
+        if (await check_video_is_dupe(url)) { // should not happen
             console.log("video is a dupe! readding it to the blacklist and refusing to navigate!");
             blacklist_url(url);
             url = await get_next_url(tab); // find another video
@@ -616,6 +626,7 @@ async function run_bot(browser: Browser): Promise<boolean> {
     // TODO: VPN/proxy functionality
     // TODO: time taken to get video (this video - last video time) ? or the other way
     // TODO: scheduler (multiple bots at once)
+    // TODO: change video quality to 144p before 'watching' the video for performance sake
 }
 
 // main
